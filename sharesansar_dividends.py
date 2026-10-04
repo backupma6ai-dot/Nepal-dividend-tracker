@@ -75,7 +75,7 @@ HEADERS = {
 }
 
 # Endpoints to try, in order, for the "Dividend History" tab data.
-DIVIDEND_ENDPOINTS = ["/company-dividend", "/company-dividend-history"]
+DIVIDEND_ENDPOINTS = ["/company-dividend", "/company-dividend-history", "/company-dividends"]
 
 
 def get_token_and_company_id(session, symbol, debug=False):
@@ -129,6 +129,20 @@ def to_dataframe(resp):
         return pd.DataFrame()
 
 
+def discover_endpoints(html):
+    """Find URLs mentioning 'dividend' inside the page's own HTML/JS."""
+    found = []
+    pat = r"""["']((?:https?://(?:www\.)?sharesansar\.com)?/[A-Za-z0-9_\-/]*dividend[A-Za-z0-9_\-/]*)["']"""
+    for m in re.finditer(pat, html, flags=re.I):
+        u = m.group(1)
+        if any(x in u.lower() for x in ("proposed", "calculator", "category", "newsdetail")):
+            continue
+        u = u.replace(BASE, "").replace("http://www.sharesansar.com", "")
+        if u not in found:
+            found.append(u)
+    return found
+
+
 def fetch_dividends(session, symbol, debug=False):
     token, company_id, html = get_token_and_company_id(session, symbol, debug)
     if not company_id:
@@ -147,23 +161,33 @@ def fetch_dividends(session, symbol, debug=False):
         "company": company_id, "_token": token or "",
     }
 
-    last_err = None
+    endpoints = discover_endpoints(html)
     for ep in DIVIDEND_ENDPOINTS:
-        try:
-            resp = session.post(BASE + ep, data=payload, headers=ajax_headers, timeout=30)
-            if debug:
-                open(f"debug_{symbol}{ep.replace('/', '_')}.txt", "w", encoding="utf-8").write(
-                    f"status={resp.status_code}\n{resp.text[:5000]}")
-            if resp.status_code != 200:
-                last_err = f"{ep} -> HTTP {resp.status_code}"
-                continue
-            df = to_dataframe(resp)
-            if not df.empty:
-                return df
-            last_err = f"{ep} -> empty"
-        except requests.RequestException as e:
-            last_err = f"{ep} -> {e}"
-    raise RuntimeError(last_err or "no data")
+        if ep not in endpoints:
+            endpoints.append(ep)
+
+    errors = []
+    for ep in endpoints:
+        for method in ("POST", "GET"):
+            try:
+                if method == "POST":
+                    resp = session.post(BASE + ep, data=payload, headers=ajax_headers, timeout=30)
+                else:
+                    resp = session.get(BASE + ep, params=payload, headers=ajax_headers, timeout=30)
+                if debug:
+                    fn = f"debug_{symbol}_{method}{ep.replace('/', '_')}.txt"
+                    open(fn, "w", encoding="utf-8").write(
+                        f"status={resp.status_code}\n{resp.text[:5000]}")
+                if resp.status_code != 200:
+                    errors.append(f"{method} {ep} -> HTTP {resp.status_code}")
+                    continue
+                df = to_dataframe(resp)
+                if not df.empty:
+                    return df
+                errors.append(f"{method} {ep} -> 200 but no table")
+            except requests.RequestException as e:
+                errors.append(f"{method} {ep} -> {e}")
+    raise RuntimeError(" | ".join(errors) or "no data")
 
 
 def normalise(df):
