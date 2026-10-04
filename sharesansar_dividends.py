@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Fetch the last N fiscal years of dividend history from ShareSansar
+Fetch the last N fiscal years of dividend history from Hamroshare (hamroshare.com.np)
 for a list of mutual-fund symbols.
 
 Usage:
@@ -23,7 +23,7 @@ import time
 import pandas as pd
 import requests
 
-BASE = "https://www.sharesansar.com"
+BASE = "https://hamroshare.com.np"
 
 SYMBOLS = {
     "H8020": "Himalayan 80-20", "SFEF": "Sunrise Focused Equity Fund",
@@ -78,116 +78,28 @@ HEADERS = {
 DIVIDEND_ENDPOINTS = ["/company-dividend", "/company-dividend-history", "/company-dividends"]
 
 
-def get_token_and_company_id(session, symbol, debug=False):
-    r = session.get(f"{BASE}/company/{symbol.lower()}", headers=HEADERS, timeout=30)
-    r.raise_for_status()
-    html = r.text
-    if debug:
-        open(f"debug_{symbol}_page.html", "w", encoding="utf-8").write(html)
-
-    token = None
-    for pat in (r'<meta[^>]+name=["\']_token["\'][^>]+content=["\']([^"\']+)',
-                r'<meta[^>]+content=["\']([^"\']+)["\'][^>]+name=["\']_token["\']',
-                r'name=["\']_token["\'][^>]*value=["\']([^"\']+)'):
-        m = re.search(pat, html)
-        if m:
-            token = m.group(1)
-            break
-
-    company_id = None
-    for pat in (r'id=["\']companyid["\'][^>]*>\s*(\d+)',
-                r'id=["\']company_id["\'][^>]*value=["\'](\d+)',
-                r'company\s*[:=]\s*["\']?(\d+)["\']?',
-                r'(\d+)\s*</[^>]+>\s*<[^>]+>\s*' + re.escape(symbol.upper())):
-        m = re.search(pat, html, flags=re.I)
-        if m:
-            company_id = m.group(1)
-            break
-    return token, company_id, html
-
-
-def to_dataframe(resp):
-    """Turn an endpoint response (JSON or HTML) into a DataFrame."""
-    text = resp.text.strip()
-    # JSON (DataTables style: {"data": [...]}) or plain list
-    try:
-        js = json.loads(text)
-        rows = js.get("data", js.get("aaData")) if isinstance(js, dict) else js
-        if rows:
-            df = pd.DataFrame(rows)
-            # cells may contain HTML fragments; strip tags
-            df = df.map(lambda v: re.sub(r"<[^>]+>", "", v).strip() if isinstance(v, str) else v)
-            return df
-        return pd.DataFrame()
-    except ValueError:
-        pass
-    # HTML table
-    try:
-        tables = pd.read_html(io.StringIO(text))
-        return tables[0] if tables else pd.DataFrame()
-    except ValueError:
-        return pd.DataFrame()
-
-
-def discover_endpoints(html):
-    """Find URLs mentioning 'dividend' inside the page's own HTML/JS."""
-    found = []
-    pat = r"""["']((?:https?://(?:www\.)?sharesansar\.com)?/[A-Za-z0-9_\-/]*dividend[A-Za-z0-9_\-/]*)["']"""
-    for m in re.finditer(pat, html, flags=re.I):
-        u = m.group(1)
-        if any(x in u.lower() for x in ("proposed", "calculator", "category", "newsdetail")):
-            continue
-        u = u.replace(BASE, "").replace("http://www.sharesansar.com", "")
-        if u not in found:
-            found.append(u)
-    return found
-
-
 def fetch_dividends(session, symbol, debug=False):
-    token, company_id, html = get_token_and_company_id(session, symbol, debug)
-    if not company_id:
-        raise RuntimeError("could not find company id on page")
-
-    ajax_headers = dict(HEADERS)
-    ajax_headers.update({
-        "X-Requested-With": "XMLHttpRequest",
-        "Referer": f"{BASE}/company/{symbol.lower()}",
-    })
-    if token:
-        ajax_headers["X-CSRF-TOKEN"] = token
-
-    payload = {
-        "draw": 1, "start": 0, "length": 100,
-        "company": company_id, "_token": token or "",
-    }
-
-    endpoints = discover_endpoints(html)
-    for ep in DIVIDEND_ENDPOINTS:
-        if ep not in endpoints:
-            endpoints.append(ep)
-
-    errors = []
-    for ep in endpoints:
-        for method in ("POST", "GET"):
-            try:
-                if method == "POST":
-                    resp = session.post(BASE + ep, data=payload, headers=ajax_headers, timeout=30)
-                else:
-                    resp = session.get(BASE + ep, params=payload, headers=ajax_headers, timeout=30)
-                if debug:
-                    fn = f"debug_{symbol}_{method}{ep.replace('/', '_')}.txt"
-                    open(fn, "w", encoding="utf-8").write(
-                        f"status={resp.status_code}\n{resp.text[:5000]}")
-                if resp.status_code != 200:
-                    errors.append(f"{method} {ep} -> HTTP {resp.status_code}")
-                    continue
-                df = to_dataframe(resp)
-                if not df.empty:
-                    return df
-                errors.append(f"{method} {ep} -> 200 but no table")
-            except requests.RequestException as e:
-                errors.append(f"{method} {ep} -> {e}")
-    raise RuntimeError(" | ".join(errors) or "no data")
+    """Read the dividend table from hamroshare.com.np (plain HTML, no login/AJAX)."""
+    url = f"{BASE}/company/{symbol.upper()}/dividends"
+    r = session.get(url, headers=HEADERS, timeout=30)
+    if r.status_code != 200:
+        raise RuntimeError(f"HTTP {r.status_code} for {url}")
+    if debug:
+        open(f"debug_{symbol}.html", "w", encoding="utf-8").write(r.text)
+    if "no dividend announcements" in r.text.lower():
+        raise RuntimeError("no dividend announcements on record")
+    try:
+        tables = pd.read_html(io.StringIO(r.text))
+    except ValueError:
+        raise RuntimeError("no table found on page")
+    df = next((t for t in tables if any("fiscal" in str(c).lower() for c in t.columns)), None)
+    if df is None or df.empty:
+        raise RuntimeError("dividend table not found")
+    # "2022-03-31 [Closed]" -> "2022-03-31"
+    for c in df.columns:
+        if "book" in str(c).lower():
+            df[c] = df[c].astype(str).str.replace(r"\s*\[.*?\]", "", regex=True).str.strip()
+    return df
 
 
 def normalise(df):
